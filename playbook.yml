@@ -1,0 +1,221 @@
+---
+# Raptor Pi Setup Playbook
+# Configures a fresh Rev Pi OS for raptor-controls kiosk mode
+#
+# Usage:
+#   ansible-playbook -i inventory.yml playbook.yml --ask-pass --ask-become-pass
+#
+# Each Pi ships with a different factory password, so use --ask-pass
+# After setup, all Pis will have the standardized password
+
+- name: Configure Raptor Pi
+  hosts: all
+  become: yes
+
+  vars:
+    kiosk_url: "https://raptor-controls.vercel.app"
+    pi_user: "pi"
+    pi_password: "b8rqse"  # Standardized password after setup
+    raptor_core_repo: "https://github.com/Sioux-Steel-Solutions/raptor-core.git"
+
+  tasks:
+    # ============================================
+    # STANDARDIZE PASSWORD
+    # ============================================
+    - name: Set standardized password for pi user
+      user:
+        name: "{{ pi_user }}"
+        password: "{{ pi_password | password_hash('sha512') }}"
+
+    # ============================================
+    # PACKAGES
+    # ============================================
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      apt:
+        name:
+          - chromium-browser
+          - docker.io
+          - docker-compose
+          - git
+          - zram-tools
+          - firefox-esr
+        state: present
+
+    # ============================================
+    # DOCKER SETUP
+    # ============================================
+    - name: Add pi user to docker group
+      user:
+        name: "{{ pi_user }}"
+        groups: docker
+        append: yes
+
+    - name: Enable Docker service
+      systemd:
+        name: docker
+        enabled: yes
+        state: started
+
+    - name: Enable containerd service
+      systemd:
+        name: containerd
+        enabled: yes
+        state: started
+
+    # ============================================
+    # RAPTOR-CORE DEPLOYMENT
+    # ============================================
+    - name: Clone raptor-core repository
+      git:
+        repo: "{{ raptor_core_repo }}"
+        dest: "/home/{{ pi_user }}/raptor-core"
+        version: main
+        force: yes
+      become_user: "{{ pi_user }}"
+
+    - name: Set raptor-core directory ownership
+      file:
+        path: "/home/{{ pi_user }}/raptor-core"
+        owner: "{{ pi_user }}"
+        group: "{{ pi_user }}"
+        recurse: yes
+
+    - name: Build and start raptor-core with docker-compose
+      community.docker.docker_compose:
+        project_src: "/home/{{ pi_user }}/raptor-core"
+        build: yes
+        state: present
+      become_user: "{{ pi_user }}"
+      ignore_errors: yes  # Fallback to shell if module not available
+
+    - name: Fallback - Start raptor-core with docker-compose (shell)
+      shell: |
+        cd /home/{{ pi_user }}/raptor-core
+        docker-compose up -d --build
+      become_user: "{{ pi_user }}"
+      when: false  # Set to true if above task fails
+
+    # ============================================
+    # AUTO-LOGIN SETUP
+    # ============================================
+    - name: Create autologin group
+      group:
+        name: autologin
+        state: present
+
+    - name: Add pi user to autologin group
+      user:
+        name: "{{ pi_user }}"
+        groups: autologin
+        append: yes
+
+    - name: Configure LightDM auto-login
+      blockinfile:
+        path: /etc/lightdm/lightdm.conf
+        marker: "# {mark} ANSIBLE MANAGED - AUTO LOGIN"
+        insertafter: "\\[Seat:\\*\\]"
+        block: |
+          autologin-user={{ pi_user }}
+          autologin-user-timeout=0
+
+    - name: Set default target to graphical
+      command: systemctl set-default graphical.target
+      changed_when: false
+
+    # ============================================
+    # CHROMIUM KIOSK AUTOSTART
+    # ============================================
+    - name: Create autostart directory
+      file:
+        path: "/home/{{ pi_user }}/.config/autostart"
+        state: directory
+        owner: "{{ pi_user }}"
+        group: "{{ pi_user }}"
+        mode: '0755'
+
+    - name: Configure Chromium kiosk autostart
+      copy:
+        dest: "/home/{{ pi_user }}/.config/autostart/chromium-kiosk.desktop"
+        owner: "{{ pi_user }}"
+        group: "{{ pi_user }}"
+        mode: '0644'
+        content: |
+          [Desktop Entry]
+          Type=Application
+          Name=Chromium Kiosk
+          Exec=bash -c "sleep 5 && /usr/bin/chromium {{ kiosk_url }}"
+          Hidden=false
+          X-GNOME-Autostart-enabled=true
+
+    # ============================================
+    # GPU / PERFORMANCE SETTINGS
+    # ============================================
+    - name: Configure GPU memory (CMA) in boot config
+      lineinfile:
+        path: /boot/firmware/config.txt
+        regexp: '^dtoverlay=vc4-kms-v3d'
+        line: 'dtoverlay=vc4-kms-v3d,cma-256'
+        state: present
+
+    - name: Set CPU to performance mode
+      lineinfile:
+        path: /boot/firmware/config.txt
+        regexp: '^arm_freq='
+        line: 'arm_freq=2400'
+        state: present
+
+    - name: Enable voltage boost
+      lineinfile:
+        path: /boot/firmware/config.txt
+        regexp: '^over_voltage='
+        line: 'over_voltage=4'
+        state: present
+
+    - name: Set CPU governor to performance
+      copy:
+        dest: /etc/default/cpufrequtils
+        content: |
+          GOVERNOR=performance
+        mode: '0644'
+
+    # ============================================
+    # ZRAM SWAP
+    # ============================================
+    - name: Enable zramswap service
+      systemd:
+        name: zramswap
+        enabled: yes
+        state: started
+
+    # ============================================
+    # UNIQUE HOSTNAME PER PI
+    # ============================================
+    - name: Set unique hostname
+      hostname:
+        name: "raptor-{{ raptor_id }}"
+
+    - name: Update /etc/hosts with new hostname
+      lineinfile:
+        path: /etc/hosts
+        regexp: '^127\.0\.1\.1'
+        line: "127.0.1.1\traptor-{{ raptor_id }}"
+        state: present
+
+    # ============================================
+    # FINAL REBOOT
+    # ============================================
+    - name: Reboot to apply all changes
+      reboot:
+        msg: "Rebooting to apply Raptor Pi configuration"
+        reboot_timeout: 300
+
+  handlers:
+    - name: Restart lightdm
+      systemd:
+        name: lightdm
+        state: restarted
