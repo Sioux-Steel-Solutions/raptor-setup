@@ -7,16 +7,34 @@
 #
 # Each Pi ships with a different factory password, so use --ask-pass
 # After setup, all Pis will have the standardized password
+#
+# Updated: 2026-01-18 - Added network-spinner, gateway, nginx, frontend
 
 - name: Configure Raptor Pi
   hosts: all
   become: yes
 
   vars:
-    kiosk_url: "https://raptor-controls.vercel.app"
+    # Kiosk now points to localhost (nginx serves static frontend)
+    kiosk_url: "http://localhost/dashboard/"
     pi_user: "pi"
     pi_password: "b8rqse"  # Standardized password after setup
+
+    # Repository URLs
     raptor_core_repo: "https://github.com/Sioux-Steel-Solutions/raptor-core.git"
+    raptor_network_spin_repo: "https://github.com/Sioux-Steel-Solutions/raptor-network-spinner.git"
+    raptor_gateway_repo: "https://github.com/Sioux-Steel-Solutions/raptor-gateway.git"
+    raptor_frontend_repo: "https://github.com/Sioux-Steel-Solutions/raptor-frontend.git"
+
+    # MQTT Configuration
+    cloud_mqtt_url: "tcp://3.141.116.27:1883"
+    cloud_mqtt_ws_url: "ws://3.141.116.27:9001"
+    cloud_mqtt_user: "raptor"
+    cloud_mqtt_pass: "raptorMQTT2025"
+
+    # Device identity (override in inventory per-device)
+    raptor_site: "shop"
+    raptor_device: "revpi-{{ raptor_id }}"
 
   tasks:
     # ============================================
@@ -44,6 +62,7 @@
           - git
           - zram-tools
           - firefox-esr
+          - nginx
         state: present
 
     # ============================================
@@ -101,6 +120,180 @@
       when: false  # Set to true if above task fails
 
     # ============================================
+    # RAPTOR-NETWORK-SPINNER DEPLOYMENT
+    # ============================================
+    - name: Clone raptor-network-spinner repository
+      git:
+        repo: "{{ raptor_network_spin_repo }}"
+        dest: "/home/{{ pi_user }}/raptor-network-spin"
+        version: main
+        force: yes
+      become_user: "{{ pi_user }}"
+
+    - name: Set raptor-network-spin directory ownership
+      file:
+        path: "/home/{{ pi_user }}/raptor-network-spin"
+        owner: "{{ pi_user }}"
+        group: "{{ pi_user }}"
+        recurse: yes
+
+    - name: Start network-spinner with docker-compose
+      shell: |
+        cd /home/{{ pi_user }}/raptor-network-spin
+        docker-compose up -d --build
+      become_user: "{{ pi_user }}"
+
+    # ============================================
+    # RAPTOR-GATEWAY DEPLOYMENT
+    # ============================================
+    - name: Clone raptor-gateway repository
+      git:
+        repo: "{{ raptor_gateway_repo }}"
+        dest: "/home/{{ pi_user }}/raptor-gateway"
+        version: main
+        force: yes
+      become_user: "{{ pi_user }}"
+
+    - name: Set raptor-gateway directory ownership
+      file:
+        path: "/home/{{ pi_user }}/raptor-gateway"
+        owner: "{{ pi_user }}"
+        group: "{{ pi_user }}"
+        recurse: yes
+
+    - name: Create raptor-gateway .env file
+      copy:
+        dest: "/home/{{ pi_user }}/raptor-gateway/.env"
+        owner: "{{ pi_user }}"
+        group: "{{ pi_user }}"
+        mode: '0600'
+        content: |
+          NETWORK_STATUS_FILE=/var/run/network-status-vol/network-status
+          LOCAL_MQTT_URL=tcp://localhost:1883
+          CLOUD_MQTT_URL={{ cloud_mqtt_url }}
+          CLOUD_MQTT_USER={{ cloud_mqtt_user }}
+          CLOUD_MQTT_PASS={{ cloud_mqtt_pass }}
+          RAPTOR_SITE={{ raptor_site }}
+          RAPTOR_DEVICE={{ raptor_device }}
+          SQLITE_PATH=/var/lib/raptor/gateway.db
+
+    - name: Start raptor-gateway with docker-compose
+      shell: |
+        cd /home/{{ pi_user }}/raptor-gateway
+        docker-compose up -d --build
+      become_user: "{{ pi_user }}"
+
+    # ============================================
+    # RAPTOR-FRONTEND DEPLOYMENT
+    # ============================================
+    - name: Clone raptor-frontend repository
+      git:
+        repo: "{{ raptor_frontend_repo }}"
+        dest: "/home/{{ pi_user }}/raptor-frontend"
+        version: main
+        force: yes
+      become_user: "{{ pi_user }}"
+
+    - name: Set raptor-frontend directory ownership
+      file:
+        path: "/home/{{ pi_user }}/raptor-frontend"
+        owner: "{{ pi_user }}"
+        group: "{{ pi_user }}"
+        recurse: yes
+
+    - name: Create frontend static files directory
+      file:
+        path: /var/www/raptor
+        state: directory
+        owner: "{{ pi_user }}"
+        group: "{{ pi_user }}"
+        mode: '0755'
+
+    # Note: Static files should be pre-built and copied, or build on Pi
+    # For now, assume pre-built 'out/' directory exists in repo
+    - name: Copy frontend static files
+      shell: |
+        cp -r /home/{{ pi_user }}/raptor-frontend/out/* /var/www/raptor/
+      become: yes
+
+    # ============================================
+    # NGINX CONFIGURATION
+    # ============================================
+    - name: Configure nginx for Raptor frontend
+      copy:
+        dest: /etc/nginx/sites-available/raptor
+        mode: '0644'
+        content: |
+          server {
+              listen 80 default_server;
+              server_name localhost;
+              root /var/www/raptor;
+              index index.html;
+
+              # Disable caching for HTML files
+              location ~* \.html$ {
+                  add_header Cache-Control "no-cache, no-store, must-revalidate";
+                  try_files $uri $uri/ =404;
+              }
+
+              # Static assets with caching
+              location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|mp4|webm|woff|woff2)$ {
+                  expires 1d;
+                  add_header Cache-Control "public, immutable";
+              }
+
+              # Network status proxy (to network-spinner)
+              location /api/network-status {
+                  proxy_pass http://localhost:8111/status;
+                  proxy_connect_timeout 2s;
+                  proxy_read_timeout 2s;
+                  add_header Access-Control-Allow-Origin *;
+              }
+
+              # SPA fallback - serve index.html for all routes
+              location / {
+                  try_files $uri $uri/ $uri.html /index.html;
+              }
+          }
+      notify: Restart nginx
+
+    - name: Enable Raptor nginx site
+      file:
+        src: /etc/nginx/sites-available/raptor
+        dest: /etc/nginx/sites-enabled/raptor
+        state: link
+      notify: Restart nginx
+
+    - name: Remove default nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: Restart nginx
+
+    - name: Enable nginx service
+      systemd:
+        name: nginx
+        enabled: yes
+        state: started
+
+    # ============================================
+    # DOCKER LOG ROTATION (Prevent SD card wear)
+    # ============================================
+    - name: Configure Docker log rotation
+      copy:
+        dest: /etc/docker/daemon.json
+        mode: '0644'
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "10m",
+              "max-file": "3"
+            }
+          }
+      notify: Restart docker
+
+    # ============================================
     # AUTO-LOGIN SETUP
     # ============================================
     - name: Create autologin group
@@ -148,7 +341,7 @@
           [Desktop Entry]
           Type=Application
           Name=Chromium Kiosk
-          Exec=bash -c "sleep 5 && /usr/bin/chromium {{ kiosk_url }}"
+          Exec=bash -c "sleep 10 && /usr/bin/chromium --kiosk --noerrdialogs --disable-infobars --start-maximized --incognito {{ kiosk_url }}"
           Hidden=false
           X-GNOME-Autostart-enabled=true
 
@@ -218,4 +411,14 @@
     - name: Restart lightdm
       systemd:
         name: lightdm
+        state: restarted
+
+    - name: Restart nginx
+      systemd:
+        name: nginx
+        state: restarted
+
+    - name: Restart docker
+      systemd:
+        name: docker
         state: restarted
